@@ -1,0 +1,2267 @@
+openapi: 3.1.0
+info:
+  title: TicketWave Access API
+  version: 1.0.0
+  summary: Public REST API for TicketWave events, orders, and the access-decision engine.
+  description: |
+    The TicketWave public API is a JSON-over-HTTPS REST surface in two namespaces:
+
+    - `/api/v1/*` reads tenant resources — events, ticket tiers, orders. Bearer
+      token, scope `plugin:read` (with optional `plugin:pii` to unmask buyer
+      identity). Rate-limited at 120 req/min/key.
+    - `/api/v2/*` is the access-decision API — register resources, write
+      rules, ask the engine for ALLOW / DENY / REVIEW, then replay, dispute,
+      and override. Rate-limited at 240 req/min/key. Scopes are
+      `plugin:read` for GETs and `plugin:write` for state-changing routes.
+
+    Key management lives at https://www.ticketwavehq.com/dashboard/settings/api-keys.
+    Tokens look like `tw_live_xxxxxxxxxxxxxxxx` and are passed in the
+    `Authorization: Bearer` header.
+
+    Tenant scoping is enforced on every row touched: a key can only ever
+    read/write resources that belong to its own `clientId`. Cross-tenant
+    probes resolve to `404` rather than `403` so the surface cannot be used
+    to enumerate other tenants' identifiers.
+
+    Schemas marked `# TODO` below are routes whose response is a passthrough
+    of an underlying Drizzle row or a third-party helper return value; the
+    handler ships the shape verbatim and the contract is "whatever the row
+    looked like at this point in time". Future versions of this spec will
+    pin those shapes once they harden.
+  contact:
+    name: TicketWave Developer Relations
+    email: developers@ticketwavehq.com
+    url: https://www.ticketwavehq.com/developers
+  license:
+    name: Proprietary — TicketWave Public API Terms
+    url: https://www.ticketwavehq.com/terms
+servers:
+  - url: https://access.ticketwavehq.com
+    description: Production (public canonical)
+  - url: https://www.ticketwavehq.com
+    description: Production (dashboard alias — same deployment)
+tags:
+  - name: meta
+    description: API index / surface discovery
+  - name: v1-events
+    description: Read events and their visible ticket tiers
+  - name: v1-orders
+    description: Read paid orders (PII gated by scope)
+  - name: v2-access
+    description: Access-decision engine — decide, log, replay
+  - name: v2-rules
+    description: Rule CRUD and stage management
+  - name: v2-resources
+    description: Resources the engine governs
+  - name: v2-actors
+    description: Actor identity claims
+  - name: v2-disputes
+    description: Disputes filed against a decision
+  - name: v2-overrides
+    description: Staff overrides on a prior decision
+  - name: v2-subscriptions
+    description: Outbound webhook subscriptions
+  - name: v2-tenants
+    description: Tenant projection
+  - name: v2-shadow
+    description: Shadow-mode disagreement triage (platform staff)
+  - name: v2-system
+    description: System-events feed (platform staff)
+security:
+  - apiKey: []
+paths:
+  /api/v1:
+    get:
+      tags: [meta]
+      operationId: getV1Index
+      summary: API v1 index
+      description: |
+        Returns a small index of available v1 endpoints plus the docs URL.
+        Deliberately unauthenticated — a curl with no Bearer header still
+        gets a 200 listing the surface, useful for surface discovery.
+      security: []
+      responses:
+        "200":
+          description: API index
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiIndex"
+  /api/v1/events:
+    get:
+      tags: [v1-events]
+      operationId: listEvents
+      summary: List events
+      description: |
+        Paginated list of the authenticated tenant's events. Pagination
+        is offset-based with a 50,000-row offset cap.
+      parameters:
+        - $ref: "#/components/parameters/EventStatusQuery"
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+      responses:
+        "200":
+          description: Page of events
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Event"
+                  pagination:
+                    $ref: "#/components/schemas/OffsetPagination"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /api/v1/events/{slug}:
+    get:
+      tags: [v1-events]
+      operationId: getEventBySlug
+      summary: Get one event by slug
+      description: |
+        Returns the same projection as `/api/v1/events` plus a `tiers` array
+        of visible ticket tiers. Returns `404` for cross-tenant or missing
+        slugs (anti-enumeration).
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Tenant-side event slug
+      responses:
+        "200":
+          description: Event with visible tiers
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventWithTiers"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /api/v1/orders:
+    get:
+      tags: [v1-orders]
+      operationId: listOrders
+      summary: List orders
+      description: |
+        Paginated list of the authenticated tenant's orders. Customer name
+        and email are masked unless the key also carries the `plugin:pii`
+        scope.
+      parameters:
+        - name: eventId
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Filter to a single event
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/OrderStatus"
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Created at or after this ISO 8601 timestamp
+        - name: until
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Created before this ISO 8601 timestamp
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+      responses:
+        "200":
+          description: Page of orders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Order"
+                  pagination:
+                    $ref: "#/components/schemas/OffsetPagination"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /api/v2:
+    get:
+      tags: [meta]
+      operationId: getV2Index
+      summary: API v2 index
+      description: |
+        Returns a small index of available v2 endpoints. Like `/api/v1`,
+        deliberately unauthenticated for surface discovery.
+      security: []
+      responses:
+        "200":
+          description: API index
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiIndex"
+  /api/v2/resources:
+    get:
+      tags: [v2-resources]
+      operationId: listAccessResources
+      summary: List access resources
+      parameters:
+        - name: kind
+          in: query
+          schema:
+            $ref: "#/components/schemas/ResourceKind"
+        - $ref: "#/components/parameters/LimitQuery"
+      responses:
+        "200":
+          description: Resources
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AccessResource"
+                  pagination:
+                    $ref: "#/components/schemas/LimitPagination"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [v2-resources]
+      operationId: createAccessResource
+      summary: Register a new access resource
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAccessResource"
+      responses:
+        "201":
+          description: Resource created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccessResource"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /api/v2/resources/{id}:
+    get:
+      tags: [v2-resources]
+      operationId: getAccessResource
+      summary: Get one access resource
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Resource
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccessResource"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v2/resources/{id}/stats:
+    get:
+      tags: [v2-resources]
+      operationId: getAccessResourceStats
+      summary: Last-hour stats for one resource (platform staff only)
+      description: |
+        Auth model differs from the rest of `/api/v2/resources`: this stats
+        surface is consumed by the staff Ops Console and requires a
+        dashboard session with the `platform_admin` role, not a tenant API
+        key.
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Stats snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResourceStats"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v2/disputes:
+    get:
+      tags: [v2-disputes]
+      operationId: listDisputes
+      summary: List disputes
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/DisputeStatus"
+        - name: actorId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: resourceId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/LimitQuery"
+      responses:
+        "200":
+          description: Disputes
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Dispute"
+                  pagination:
+                    $ref: "#/components/schemas/LimitPagination"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [v2-disputes]
+      operationId: createDispute
+      summary: Open a dispute
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDispute"
+      responses:
+        "201":
+          description: Dispute created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Dispute"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v2/disputes/{disputeId}/resolve:
+    post:
+      tags: [v2-disputes]
+      operationId: resolveDispute
+      summary: Resolve a dispute
+      description: |
+        Records the ground-truth label on the original decision. Emits a
+        `dispute.resolved` system event for the Learning Engine.
+      parameters:
+        - name: disputeId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResolveDispute"
+      responses:
+        "200":
+          description: Resolution recorded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DisputeResolution"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /api/v2/tenants:
+    get:
+      tags: [v2-tenants]
+      operationId: getCurrentTenant
+      summary: Get the authenticated tenant
+      responses:
+        "200":
+          description: Current tenant
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Tenant"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [v2-tenants]
+      operationId: createTenant
+      summary: Create a tenant (501 — not exposed)
+      description: |
+        Returns `501 Not Implemented`. Self-service tenant creation is not
+        exposed via the public API; tenant provisioning is platform-managed
+        (Stripe Connect onboarding, billing, KYC).
+      responses:
+        "501":
+          description: Not exposed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v2/tenants/{id}:
+    get:
+      tags: [v2-tenants]
+      operationId: getTenantById
+      summary: Get one tenant
+      description: |
+        Returns `404` unless `{id}` matches the authenticated key's own
+        `clientId`. By design, a Bearer key cannot read a sibling tenant.
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Tenant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Tenant"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v2/event-subscriptions:
+    get:
+      tags: [v2-subscriptions]
+      operationId: listEventSubscriptions
+      summary: List outbound webhook subscriptions
+      responses:
+        "200":
+          description: Subscriptions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/EventSubscription"
+                  pagination:
+                    $ref: "#/components/schemas/LimitPagination"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [v2-subscriptions]
+      operationId: createEventSubscription
+      summary: Create an outbound webhook subscription
+      description: |
+        The plaintext HMAC signing secret is returned ONCE in this response
+        and is never recoverable again — store it on receipt.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateEventSubscription"
+      responses:
+        "201":
+          description: Subscription created (signing secret surfaced once)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventSubscriptionCreated"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/v2/event-subscriptions/{subscriptionId}:
+    get:
+      tags: [v2-subscriptions]
+      operationId: getEventSubscription
+      summary: Get one subscription
+      parameters:
+        - $ref: "#/components/parameters/SubscriptionIdPath"
+      responses:
+        "200":
+          description: Subscription
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventSubscription"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [v2-subscriptions]
+      operationId: updateEventSubscription
+      summary: Partial-update a subscription
+      parameters:
+        - $ref: "#/components/parameters/SubscriptionIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateEventSubscription"
+      responses:
+        "200":
+          description: Updated subscription
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventSubscription"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [v2-subscriptions]
+      operationId: deleteEventSubscription
+      summary: Soft-delete a subscription
+      description: Flips `active = false`; the row and its deliveries are preserved.
+      parameters:
+        - $ref: "#/components/parameters/SubscriptionIdPath"
+      responses:
+        "200":
+          description: Soft-deleted subscription
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventSubscription"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v2/access/decide:
+    post:
+      tags: [v2-access]
+      operationId: decideAccess
+      summary: Ask the engine for an ALLOW / DENY / REVIEW decision
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DecideRequest"
+      responses:
+        "200":
+          description: Decision
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecideResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/v2/access/overrides:
+    get:
+      tags: [v2-overrides]
+      operationId: listOverridesForLog
+      summary: List overrides applied to one access log
+      parameters:
+        - name: accessLogId
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Overrides
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [accessLogId, overrides, count]
+                properties:
+                  accessLogId:
+                    type: string
+                    format: uuid
+                  overrides:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AccessOverride"
+                  count:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [v2-overrides]
+      operationId: createOverride
+      summary: Flip a prior decision with an override
+      description: |
+        Records the override AND writes a new `access_logs` row with the
+        flipped verdict. The original log is left untouched.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateOverride"
+      responses:
+        "201":
+          description: Override created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateOverrideResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /api/v2/access/rules:
+    get:
+      tags: [v2-rules]
+      operationId: listAccessRules
+      summary: List access rules
+      parameters:
+        - name: resourceKind
+          in: query
+          schema:
+            $ref: "#/components/schemas/ResourceKind"
+        - name: actorKind
+          in: query
+          schema:
+            $ref: "#/components/schemas/ActorKind"
+        - $ref: "#/components/parameters/LimitQuery"
+      responses:
+        "200":
+          description: Rules (tenant + platform-wide)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AccessRule"
+                  pagination:
+                    $ref: "#/components/schemas/LimitPagination"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [v2-rules]
+      operationId: createAccessRule
+      summary: Create a tenant-scoped access rule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAccessRule"
+      responses:
+        "201":
+          description: Rule created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccessRule"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/v2/access/stage:
+    get:
+      tags: [v2-rules]
+      operationId: getAccessCoreStage
+      summary: Get current access-core stage and Stage 1 readiness
+      description: Dashboard session + `platform_admin` only, scoped to the user's own tenant.
+      responses:
+        "200":
+          description: Stage and readiness report
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccessCoreStage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [v2-rules]
+      operationId: setAccessCoreStage
+      summary: Flip access-core stage (0 → 1 → 2)
+      description: |
+        Stage 1 → 2 is gated by `checkStage1Readiness`. Pass `{ force: true }`
+        to bypass; that path is recorded on the audit trail.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetAccessCoreStage"
+      responses:
+        "200":
+          description: Stage updated (or no-op)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccessCoreStageUpdated"
+        "400":
+          description: Readiness gate failed or bad body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StageReadinessError"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /api/v2/access/system-events:
+    get:
+      tags: [v2-system]
+      operationId: listSystemEvents
+      summary: System-events feed (platform staff only)
+      description: Dashboard session + `platform_admin`. Forward-keyset pagination via `since`.
+      parameters:
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: createdAt > since. Server defaults to last 24h on omit.
+        - $ref: "#/components/parameters/LimitQuery"
+        - name: severity
+          in: query
+          schema:
+            $ref: "#/components/schemas/SystemEventSeverity"
+        - name: type
+          in: query
+          schema:
+            type: string
+            maxLength: 80
+          description: Exact match — for example `dispute.resolved`.
+        - name: tenantId
+          in: query
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: System events
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SystemEvent"
+                  pagination:
+                    $ref: "#/components/schemas/SincePagination"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /api/v2/access/logs:
+    get:
+      tags: [v2-access]
+      operationId: listAccessLogsLive
+      summary: Live access-logs tail (platform staff only)
+      description: |
+        Dashboard session + `platform_admin`. Powers the Live Access feed
+        UI. Bearer-authenticated SDKs use the by-actor sibling endpoint.
+      parameters:
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - $ref: "#/components/parameters/LimitQuery"
+        - name: tenantId
+          in: query
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Access logs
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AccessLog"
+                  pagination:
+                    $ref: "#/components/schemas/SincePagination"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /api/v2/access/logs/{logId}/replay:
+    get:
+      tags: [v2-access]
+      operationId: replayAccessLog
+      summary: Decision replay — full snapshot for one log row
+      parameters:
+        - name: logId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Replay snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecisionReplay"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v2/access/logs/by-actor/{actorId}:
+    get:
+      tags: [v2-access]
+      operationId: listAccessLogsByActor
+      summary: List recent decisions for one actor
+      description: Keyset pagination via `cursor` (createdAt < cursor).
+      parameters:
+        - name: actorId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - $ref: "#/components/parameters/LimitQuery"
+      responses:
+        "200":
+          description: Access logs
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AccessLogShort"
+                  pagination:
+                    $ref: "#/components/schemas/CursorPagination"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v2/access/shadow-metrics:
+    get:
+      tags: [v2-shadow]
+      operationId: getShadowMetrics
+      summary: Shadow-mode telemetry snapshot (platform staff only)
+      responses:
+        "200":
+          description: Shadow metrics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ShadowMetrics"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /api/v2/access/shadow-disagreements:
+    get:
+      tags: [v2-shadow]
+      operationId: listShadowDisagreements
+      summary: List shadow.disagreement events (platform staff only)
+      parameters:
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - $ref: "#/components/parameters/LimitQuery"
+        - name: tenantId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: surface
+          in: query
+          schema:
+            type: string
+            maxLength: 80
+      responses:
+        "200":
+          description: Disagreement rows
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ShadowDisagreement"
+                  pagination:
+                    $ref: "#/components/schemas/CursorPagination"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /api/v2/access/shadow-disagreements/{eventId}:
+    get:
+      tags: [v2-shadow]
+      operationId: getShadowDisagreement
+      summary: Get one shadow disagreement plus linked access log
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Disagreement + access log
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ShadowDisagreementDetail"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [v2-shadow]
+      operationId: convertShadowDisagreementToDispute
+      summary: Convert a shadow disagreement into a dispute
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action:
+                  type: string
+                  enum: [convert_to_dispute]
+      responses:
+        "200":
+          description: Dispute id (new or reused)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [disputeId, reused]
+                properties:
+                  disputeId:
+                    type: string
+                    format: uuid
+                  reused:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          description: Unknown action
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v2/identity/claims:
+    get:
+      tags: [v2-actors]
+      operationId: listIdentityClaims
+      summary: List active identity claims for an actor
+      parameters:
+        - name: actorId
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Active claims
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/IdentityClaim"
+                  pagination:
+                    type: object
+                    required: [returned]
+                    properties:
+                      returned:
+                        type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [v2-actors]
+      operationId: createIdentityClaim
+      summary: Record a verified identity claim
+      description: |
+        Persists an already-verified claim from an upstream provider
+        (EUDI wallet, GOV.UK One Login, Stripe Identity, custom KYC) and
+        recomputes the actor's aggregate `identity_confidence` score. This
+        endpoint NEVER calls a provider itself.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateIdentityClaim"
+      responses:
+        "201":
+          description: Claim recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [claimId, newConfidence]
+                properties:
+                  claimId:
+                    type: string
+                    format: uuid
+                  newConfidence:
+                    type: number
+                    minimum: 0
+                    maximum: 1
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: tw_live_*
+      description: |
+        TicketWave API key. Format `tw_live_xxxxxxxxxxxxxxxx`. Pass via
+        `Authorization: Bearer <key>`. Manage at
+        `https://www.ticketwavehq.com/dashboard/settings/api-keys`.
+  parameters:
+    PageQuery:
+      name: page
+      in: query
+      description: 1-indexed page number (default 1)
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSizeQuery:
+      name: pageSize
+      in: query
+      description: Items per page (default 50, max 200)
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    LimitQuery:
+      name: limit
+      in: query
+      description: Items returned (default 50, max 200)
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    EventStatusQuery:
+      name: status
+      in: query
+      description: Filter events by status
+      schema:
+        type: string
+        enum: [published, draft, cancelled, completed]
+    IdPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    SubscriptionIdPath:
+      name: subscriptionId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or invalid Bearer token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Authenticated but lacks the required scope or role
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Not found (or cross-tenant probe collapsed to 404)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: State conflict (immutable resource, unique constraint, etc.)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RateLimited:
+      description: Per-key or per-IP rate limit exceeded
+      headers:
+        retry-after:
+          schema:
+            type: integer
+          description: Seconds to wait before retrying
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Human-readable error message
+    ApiIndex:
+      type: object
+      required: [api, version, endpoints]
+      properties:
+        api:
+          type: string
+        version:
+          type: string
+        documentation:
+          type: string
+          format: uri
+        endpoints:
+          type: array
+          items:
+            type: object
+            required: [method, path, description]
+            properties:
+              method:
+                type: string
+              path:
+                type: string
+              description:
+                type: string
+        authentication:
+          type: object
+          properties:
+            scheme:
+              type: string
+            example:
+              type: string
+            keyManagement:
+              type: string
+              format: uri
+        rateLimit:
+          type: string
+    OffsetPagination:
+      type: object
+      required: [page, pageSize, total, totalPages, hasMore]
+      properties:
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        total:
+          type: integer
+        totalPages:
+          type: integer
+        hasMore:
+          type: boolean
+    LimitPagination:
+      type: object
+      required: [limit, returned]
+      properties:
+        limit:
+          type: integer
+        returned:
+          type: integer
+    CursorPagination:
+      type: object
+      required: [limit, hasMore]
+      properties:
+        limit:
+          type: integer
+        nextCursor:
+          type:
+            - string
+            - "null"
+          format: date-time
+        hasMore:
+          type: boolean
+    SincePagination:
+      type: object
+      required: [limit, since, hasMore]
+      properties:
+        limit:
+          type: integer
+        since:
+          type: string
+          format: date-time
+        newestCreatedAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+        hasMore:
+          type: boolean
+    Event:
+      type: object
+      required:
+        - id
+        - slug
+        - title
+        - status
+        - date
+        - venue
+      properties:
+        id:
+          type: string
+          format: uuid
+        slug:
+          type: string
+        title:
+          type: string
+        description:
+          type:
+            - string
+            - "null"
+        status:
+          type: string
+          enum: [published, draft, cancelled, completed]
+        date:
+          type: string
+          format: date
+        startTime:
+          type:
+            - string
+            - "null"
+        endTime:
+          type:
+            - string
+            - "null"
+        capacity:
+          type:
+            - integer
+            - "null"
+        category:
+          type:
+            - string
+            - "null"
+        isVirtual:
+          type: boolean
+        venue:
+          type: object
+          required: [name, city]
+          properties:
+            name:
+              type: string
+            city:
+              type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    EventWithTiers:
+      allOf:
+        - $ref: "#/components/schemas/Event"
+        - type: object
+          required: [tiers]
+          properties:
+            tiers:
+              type: array
+              items:
+                $ref: "#/components/schemas/TicketTier"
+    TicketTier:
+      type: object
+      required: [id, name, price, currency, quantity]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        description:
+          type:
+            - string
+            - "null"
+        price:
+          type: number
+        currency:
+          type: string
+          description: ISO 4217 code
+          example: GBP
+        quantity:
+          type: integer
+    OrderStatus:
+      type: string
+      enum:
+        - pending
+        - paid
+        - deposit_paid
+        - refunded
+        - partially_refunded
+        - cancelled
+        - disputed
+    Order:
+      type: object
+      required:
+        - id
+        - orderNumber
+        - status
+        - subtotal
+        - discount
+        - total
+        - currency
+        - event
+        - customer
+      properties:
+        id:
+          type: string
+          format: uuid
+        orderNumber:
+          type: string
+        status:
+          $ref: "#/components/schemas/OrderStatus"
+        subtotal:
+          type: number
+        discount:
+          type: number
+        total:
+          type: number
+        currency:
+          type: string
+        paymentMethod:
+          type:
+            - string
+            - "null"
+        paidAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        event:
+          type: object
+          required: [id, title, date]
+          properties:
+            id:
+              type: string
+              format: uuid
+            title:
+              type: string
+            date:
+              type: string
+              format: date
+        customer:
+          oneOf:
+            - $ref: "#/components/schemas/CustomerFull"
+            - $ref: "#/components/schemas/CustomerMasked"
+    CustomerFull:
+      type: object
+      required: [name, email]
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+    CustomerMasked:
+      type: object
+      required: [name, email, masked]
+      properties:
+        name:
+          type: string
+          example: Jordan G.
+        email:
+          type: string
+          example: jo****@example.com
+        masked:
+          type: boolean
+          enum: [true]
+    Tenant:
+      type: object
+      required: [id, slug, name, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        slug:
+          type: string
+        name:
+          type: string
+        status:
+          type: string
+    ResourceKind:
+      type: string
+      description: |
+        Kinds of resource the access engine governs. Source of truth is
+        `ACCESS_RESOURCE_KINDS` in `@ticketwave/db/schema`.
+      enum: [event, ticket, door, api_route]
+    ActorKind:
+      type: string
+      description: |
+        Kinds of actor in the access engine. Source of truth is
+        `ACCESS_ACTOR_KINDS` in `@ticketwave/db/schema`.
+      enum: [user, anonymous, service, device]
+    AccessRuleEffect:
+      type: string
+      description: |
+        Source of truth is `ACCESS_RULE_EFFECTS` in `@ticketwave/db/schema`.
+      enum: [allow, deny, challenge]
+    AccessResource:
+      type: object
+      description: |
+        # TODO Pinned shape — this endpoint currently passes the underlying
+        Drizzle row through verbatim. Field names below reflect the row at
+        ship time; new columns may appear additively.
+      required: [id, clientId, kind, externalId, attributes, isActive, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        clientId:
+          type: string
+          format: uuid
+        kind:
+          $ref: "#/components/schemas/ResourceKind"
+        externalId:
+          type: string
+          maxLength: 255
+        displayName:
+          type:
+            - string
+            - "null"
+        attributes:
+          type: object
+          additionalProperties: true
+        isActive:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    CreateAccessResource:
+      type: object
+      required: [kind, externalId]
+      properties:
+        kind:
+          $ref: "#/components/schemas/ResourceKind"
+        externalId:
+          type: string
+          minLength: 1
+          maxLength: 255
+        displayName:
+          type: string
+          maxLength: 255
+        attributes:
+          type: object
+          additionalProperties: true
+          default: {}
+        isActive:
+          type: boolean
+          default: true
+    ResourceStats:
+      type: object
+      required: [resource, window, counts, total, denyTrend, recent]
+      properties:
+        resource:
+          type: object
+          required: [id, clientId, kind, externalId, isActive]
+          properties:
+            id:
+              type: string
+              format: uuid
+            clientId:
+              type: string
+              format: uuid
+            kind:
+              $ref: "#/components/schemas/ResourceKind"
+            externalId:
+              type: string
+            displayName:
+              type:
+                - string
+                - "null"
+            isActive:
+              type: boolean
+        window:
+          type: object
+          required: [ms, since, bucketMs, buckets]
+          properties:
+            ms:
+              type: integer
+            since:
+              type: string
+              format: date-time
+            bucketMs:
+              type: integer
+            buckets:
+              type: integer
+        capacity:
+          type:
+            - integer
+            - "null"
+        currentAttendance:
+          type:
+            - integer
+            - "null"
+        load:
+          type:
+            - number
+            - "null"
+        counts:
+          type: object
+          required: [allow, deny, defer, challenge]
+          properties:
+            allow:
+              type: integer
+            deny:
+              type: integer
+            defer:
+              type: integer
+            challenge:
+              type: integer
+        total:
+          type: integer
+        allowRate:
+          type:
+            - number
+            - "null"
+        denyTrend:
+          type: array
+          items:
+            type: integer
+        recent:
+          type: array
+          items:
+            $ref: "#/components/schemas/AccessLogShort"
+    AccessRule:
+      type: object
+      description: |
+        # TODO Pinned shape — currently a Drizzle-row passthrough plus a
+        derived `scope` field. Existing field set is stable; new columns
+        may appear additively.
+      required:
+        - id
+        - clientId
+        - name
+        - priority
+        - effect
+        - conditions
+        - isEnabled
+        - createdAt
+      properties:
+        id:
+          type: string
+          format: uuid
+        clientId:
+          type:
+            - string
+            - "null"
+          format: uuid
+          description: NULL means a platform-wide rule.
+        name:
+          type: string
+        description:
+          type:
+            - string
+            - "null"
+        priority:
+          type: integer
+        effect:
+          $ref: "#/components/schemas/AccessRuleEffect"
+        actorKind:
+          oneOf:
+            - $ref: "#/components/schemas/ActorKind"
+            - type: "null"
+        resourceKind:
+          oneOf:
+            - $ref: "#/components/schemas/ResourceKind"
+            - type: "null"
+        conditions:
+          type: object
+          additionalProperties: true
+        isEnabled:
+          type: boolean
+        activeFrom:
+          type:
+            - string
+            - "null"
+          format: date-time
+        activeTo:
+          type:
+            - string
+            - "null"
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+        scope:
+          type: string
+          enum: [tenant, platform]
+    CreateAccessRule:
+      type: object
+      required: [name, effect]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 2000
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          default: 1000
+        effect:
+          $ref: "#/components/schemas/AccessRuleEffect"
+        actorKind:
+          oneOf:
+            - $ref: "#/components/schemas/ActorKind"
+            - type: "null"
+        resourceKind:
+          oneOf:
+            - $ref: "#/components/schemas/ResourceKind"
+            - type: "null"
+        conditions:
+          type: object
+          additionalProperties: true
+          default: {}
+        isEnabled:
+          type: boolean
+          default: true
+        activeFrom:
+          type:
+            - string
+            - "null"
+          format: date-time
+        activeTo:
+          type:
+            - string
+            - "null"
+          format: date-time
+    AccessCoreStage:
+      type: object
+      required: [stage, readiness]
+      properties:
+        stage:
+          type: integer
+          enum: [0, 1, 2]
+        readiness:
+          # TODO Shape provided by `checkStage1Readiness` in
+          # @ticketwave/access-core; passed through verbatim.
+          type: object
+          additionalProperties: true
+    SetAccessCoreStage:
+      type: object
+      required: [stage]
+      properties:
+        stage:
+          type: integer
+          enum: [0, 1, 2]
+        force:
+          type: boolean
+          default: false
+    AccessCoreStageUpdated:
+      type: object
+      required: [stage, updated]
+      properties:
+        stage:
+          type: integer
+        updated:
+          type: boolean
+    StageReadinessError:
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          properties:
+            readiness:
+              type: object
+              additionalProperties: true
+            hint:
+              type: string
+    DecideRequest:
+      type: object
+      required: [actorId, resourceId]
+      properties:
+        actorId:
+          type: string
+          format: uuid
+        resourceId:
+          type: string
+          format: uuid
+        context:
+          type: object
+          properties:
+            requestId:
+              type: string
+              maxLength: 100
+            ipAddress:
+              type: string
+              maxLength: 45
+            userAgent:
+              type: string
+            extras:
+              type: object
+              additionalProperties: true
+            now:
+              type: string
+              format: date-time
+              description: |
+                Caller-supplied wall-clock for replay determinism. Production
+                door scanners SHOULD always pass their own timestamp.
+        trustMode:
+          type: string
+          enum: [strict, flexible, hybrid]
+          default: strict
+    DecideResponse:
+      type: object
+      required: [decision, reason, logId, trace]
+      properties:
+        decision:
+          type: string
+          enum: [allow, deny, defer, challenge]
+        reason:
+          type: string
+        logId:
+          type: string
+          format: uuid
+        trace:
+          # TODO Trace shape comes from the engine and is treated as
+          # opaque by the HTTP surface.
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    AccessLogShort:
+      type: object
+      required: [id, decision, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        resourceId:
+          type:
+            - string
+            - "null"
+          format: uuid
+        ruleId:
+          type:
+            - string
+            - "null"
+          format: uuid
+        decision:
+          type: string
+          enum: [allow, deny, defer, challenge]
+        reasonCode:
+          type:
+            - string
+            - "null"
+        reasonText:
+          type:
+            - string
+            - "null"
+        requestId:
+          type:
+            - string
+            - "null"
+        latencyMs:
+          type:
+            - integer
+            - "null"
+        createdAt:
+          type: string
+          format: date-time
+    AccessLog:
+      allOf:
+        - $ref: "#/components/schemas/AccessLogShort"
+        - type: object
+          properties:
+            clientId:
+              type: string
+              format: uuid
+            actorId:
+              type:
+                - string
+                - "null"
+              format: uuid
+    DecisionReplay:
+      type: object
+      required: [log, decision, ruleTrace, disputes, overrides]
+      properties:
+        log:
+          # TODO Full Drizzle row from `access_logs` — included verbatim
+          # for forensic completeness.
+          type: object
+          additionalProperties: true
+        decision:
+          type: object
+          required: [final, reason]
+          properties:
+            final:
+              type: string
+              enum: [ALLOW, DENY, REVIEW]
+            reason:
+              type: string
+        trustState:
+          type:
+            - object
+            - "null"
+          additionalProperties: true
+        ruleTrace:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        fraudSnapshot:
+          type:
+            - object
+            - "null"
+          additionalProperties: true
+        disputes:
+          type: array
+          items:
+            $ref: "#/components/schemas/Dispute"
+        overrides:
+          type: array
+          items:
+            $ref: "#/components/schemas/AccessOverride"
+    AccessOverride:
+      # TODO Pinned shape — Drizzle-row passthrough today.
+      type: object
+      additionalProperties: true
+    CreateOverride:
+      type: object
+      required: [accessLogId, overrideAction, reason]
+      properties:
+        accessLogId:
+          type: string
+          format: uuid
+        overrideAction:
+          type: string
+          description: |
+            One of the values declared in `OVERRIDE_ACTIONS` in
+            `@ticketwave/access-core`.
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 2000
+    CreateOverrideResponse:
+      type: object
+      required: [overrideId, newAccessLogId, overrideAction]
+      properties:
+        overrideId:
+          type: string
+          format: uuid
+        newAccessLogId:
+          type: string
+          format: uuid
+        overrideAction:
+          type: string
+    DisputeStatus:
+      type: string
+      description: |
+        Source of truth is `ACCESS_DISPUTE_STATUSES` in `@ticketwave/db/schema`.
+      enum: [open, in_review, resolved, withdrawn]
+    DisputeType:
+      type: string
+      enum: [denial, fraud_flag, override_conflict, system_inconsistency]
+    Dispute:
+      # TODO Pinned shape — Drizzle-row passthrough today.
+      type: object
+      additionalProperties: true
+    CreateDispute:
+      type: object
+      required: [actorId, resourceId, accessLogId, disputeType]
+      properties:
+        actorId:
+          type: string
+          format: uuid
+        resourceId:
+          type: string
+          format: uuid
+        accessLogId:
+          type: string
+          format: uuid
+        disputeType:
+          $ref: "#/components/schemas/DisputeType"
+        reason:
+          type: string
+          maxLength: 4000
+    ResolveDispute:
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          description: |
+            One of the values declared in `RESOLUTION_ACTIONS` in
+            `@ticketwave/access-core`.
+        notes:
+          type: string
+          maxLength: 4000
+    DisputeResolution:
+      # TODO Resolution shape is returned by `resolveDispute` in
+      # `@ticketwave/access-core`.
+      type: object
+      additionalProperties: true
+    EventSubscription:
+      type: object
+      required: [id, name, targetUrl, eventTypes, active]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        targetUrl:
+          type: string
+          format: uri
+        eventTypes:
+          type: array
+          items:
+            type: string
+        active:
+          type: boolean
+    EventSubscriptionCreated:
+      allOf:
+        - $ref: "#/components/schemas/EventSubscription"
+        - type: object
+          required: [signingSecret]
+          properties:
+            signingSecret:
+              type: string
+              description: |
+                Plaintext HMAC signing secret. Returned ONCE — store it
+                immediately, it cannot be recovered later.
+    CreateEventSubscription:
+      type: object
+      required: [name, targetUrl, eventTypes]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        targetUrl:
+          type: string
+          format: uri
+          description: Must use https://. Re-validated against an SSRF allow-list.
+        eventTypes:
+          type: array
+          minItems: 1
+          items:
+            type: string
+    UpdateEventSubscription:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        targetUrl:
+          type: string
+          format: uri
+        eventTypes:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        active:
+          type: boolean
+    IdentityProvider:
+      type: string
+      description: |
+        Source of truth is `IDENTITY_PROVIDERS` in `@ticketwave/access-core`.
+      enum:
+        - eudi
+        - gov_uk_one_login
+        - stripe_identity
+        - custom
+    IdentityClaim:
+      # TODO Pinned shape — the response data comes from
+      # `getActiveClaimsForActor` and is returned verbatim.
+      type: object
+      additionalProperties: true
+    CreateIdentityClaim:
+      type: object
+      required: [actorId, provider, claimType, verifiedAt]
+      properties:
+        actorId:
+          type: string
+          format: uuid
+        provider:
+          $ref: "#/components/schemas/IdentityProvider"
+        claimType:
+          type: string
+          minLength: 1
+          maxLength: 80
+        claimValue:
+          type: object
+          additionalProperties: true
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        verifiedAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+        sourceReference:
+          type: string
+          maxLength: 200
+        metadata:
+          type: object
+          additionalProperties: true
+    SystemEventSeverity:
+      type: string
+      enum: [info, warn, error, critical]
+    SystemEvent:
+      type: object
+      required: [id, type, severity, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        clientId:
+          type:
+            - string
+            - "null"
+          format: uuid
+        type:
+          type: string
+          maxLength: 80
+        severity:
+          $ref: "#/components/schemas/SystemEventSeverity"
+        summary:
+          type:
+            - string
+            - "null"
+        payload:
+          type: object
+          additionalProperties: true
+        createdAt:
+          type: string
+          format: date-time
+    ShadowMetrics:
+      # TODO Shape returned by `loadShadowMetrics` in the intelligence
+      # section's RSC loader; passed through verbatim.
+      type: object
+      additionalProperties: true
+    ShadowDisagreement:
+      type: object
+      required: [id, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        clientId:
+          type:
+            - string
+            - "null"
+          format: uuid
+        clientName:
+          type:
+            - string
+            - "null"
+        createdAt:
+          type: string
+          format: date-time
+        surface:
+          type:
+            - string
+            - "null"
+        legacyDecision:
+          type:
+            - string
+            - "null"
+        shadowDecision:
+          type:
+            - string
+            - "null"
+        reason:
+          type:
+            - string
+            - "null"
+        accessLogId:
+          type:
+            - string
+            - "null"
+          format: uuid
+    ShadowDisagreementDetail:
+      type: object
+      required: [id, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        clientId:
+          type:
+            - string
+            - "null"
+          format: uuid
+        clientName:
+          type:
+            - string
+            - "null"
+        createdAt:
+          type: string
+          format: date-time
+        payload:
+          type: object
+          additionalProperties: true
+        accessLog:
+          # TODO Full access-log row when one is linked from the
+          # disagreement payload; null otherwise.
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: "null"
