@@ -1,6 +1,6 @@
 # TicketWave OpenAPI spec
 
-The canonical OpenAPI 3.1 specification for the **TicketWave Access API** — the public JSON-over-HTTPS surface served at `https://access.ticketwavehq.com`.
+The canonical OpenAPI 3.1 specification for the **TicketWave API** — the public JSON-over-HTTPS surface served at `https://access.ticketwavehq.com`.
 
 This is the **same spec** that powers:
 
@@ -17,7 +17,7 @@ A single [`openapi.yaml`](./openapi.yaml) describing two API namespaces:
 | Namespace | Purpose | Auth scope | Rate limit |
 |---|---|---|---|
 | `/api/v1/*` | Read tenant resources — events, ticket tiers, orders. | `plugin:read` (+ optional `plugin:pii` to unmask buyers) | 120 req/min/key |
-| `/api/v2/*` | The access-decision engine — register resources, write rules, ask for `ALLOW` / `DENY` / `REVIEW`, replay, dispute, override. | `plugin:read` for GETs, `plugin:write` for state changes | 240 req/min/key |
+| `/api/v2/*` | The commerce engine — register resources, write rules, ask for `ALLOW` / `DENY` / `REVIEW`, replay, dispute, override. | `plugin:read` for GETs, `plugin:write` for state changes | 240 req/min/key |
 
 **Current shape (v1.0.0):**
 
@@ -96,4 +96,4 @@ Found a discrepancy between the spec and the live API? Open an issue here, or em
 
 Apache License 2.0 — see [`LICENSE`](./LICENSE).
 
-The TicketWave Access API itself is offered under the proprietary [TicketWave Public API Terms](https://www.ticketwavehq.com/terms); this OpenAPI document describing the API is Apache-2.0 so you can vendor, fork, generate clients from, and redistribute it freely.
+The TicketWave API itself is offered under the proprietary [TicketWave Public API Terms](https://www.ticketwavehq.com/terms); this OpenAPI document describing the API is Apache-2.0 so you can vendor, fork, generate clients from, and redistribute it freely.
