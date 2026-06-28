@@ -1,8 +1,26 @@
 # Changelog
 
-All notable changes to the TicketWave Access API OpenAPI specification are recorded in this file.
+All notable changes to the TicketWave API OpenAPI specification are recorded in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) per the rules in [`README.md`](./README.md#versioning-policy).
+
+## [1.0.1] — 2026-06-28
+
+Brand-name canon alignment + apex URL sweep. No wire-format changes.
+
+### Changed
+
+- `info.title` renamed from "TicketWave Access API" to "TicketWave API" to align with the canonical brand name (canon §3).
+- All `www.ticketwavehq.com` references swept to the apex `ticketwavehq.com`:
+  - `info.contact.url`
+  - `info.license.url`
+  - `info.description` (api-keys URL)
+  - `servers[1].url` (dashboard alias)
+  - `components.securitySchemes.apiKey.description` (api-keys URL)
+  - README License section
+  - this CHANGELOG (footer reference below)
+
+[1.0.1]: https://github.com/TicketWaveHQ/openapi-spec/releases/tag/v1.0.1
 
 ## [1.0.0] — 2026-06-25
 
@@ -29,7 +47,7 @@ Initial public release of the spec.
 - Bearer-token security scheme (`apiKey`) with `tw_live_*` token format documentation.
 - 14 tags grouping the surface by domain.
 - 64 component schemas covering requests, responses, and shared envelopes (`OffsetPagination`, `LimitPagination`, `Money`, `CustomerMasked`, `Tenant`, `Decision`, `Rule`, `Resource`, `Actor`, `Dispute`, `Override`, `Subscription`, `SystemEvent`, …).
-- Canonical server `https://access.ticketwavehq.com` listed first; dashboard alias `https://www.ticketwavehq.com` listed second (both resolve to the same deployment).
+- Canonical server `https://access.ticketwavehq.com` listed first; dashboard alias `https://ticketwavehq.com` listed second (both resolve to the same deployment).
 - Rate-limit guidance: 120 req/min/key on v1, 240 req/min/key on v2.
 
 ### Surface counts

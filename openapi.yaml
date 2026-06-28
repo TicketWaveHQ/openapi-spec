@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
-  title: TicketWave Access API
-  version: 1.0.0
+  title: TicketWave API
+  version: 1.0.1
   summary: Public REST API for TicketWave events, orders, and the access-decision engine.
   description: |
     The TicketWave public API is a JSON-over-HTTPS REST surface in two namespaces:
@@ -14,7 +14,7 @@ info:
       and override. Rate-limited at 240 req/min/key. Scopes are
       `plugin:read` for GETs and `plugin:write` for state-changing routes.
 
-    Key management lives at https://www.ticketwavehq.com/dashboard/settings/api-keys.
+    Key management lives at https://ticketwavehq.com/dashboard/settings/api-keys.
     Tokens look like `tw_live_xxxxxxxxxxxxxxxx` and are passed in the
     `Authorization: Bearer` header.
 
@@ -31,14 +31,14 @@ info:
   contact:
     name: TicketWave Developer Relations
     email: developers@ticketwavehq.com
-    url: https://www.ticketwavehq.com/developers
+    url: https://ticketwavehq.com/developers
   license:
     name: Proprietary — TicketWave Public API Terms
-    url: https://www.ticketwavehq.com/terms
+    url: https://ticketwavehq.com/terms
 servers:
   - url: https://access.ticketwavehq.com
     description: Production (public canonical)
-  - url: https://www.ticketwavehq.com
+  - url: https://ticketwavehq.com
     description: Production (dashboard alias — same deployment)
 tags:
   - name: meta
@@ -1152,7 +1152,7 @@ components:
       description: |
         TicketWave API key. Format `tw_live_xxxxxxxxxxxxxxxx`. Pass via
         `Authorization: Bearer <key>`. Manage at
-        `https://www.ticketwavehq.com/dashboard/settings/api-keys`.
+        `https://ticketwavehq.com/dashboard/settings/api-keys`.
   parameters:
     PageQuery:
       name: page
