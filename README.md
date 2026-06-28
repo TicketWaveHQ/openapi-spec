@@ -26,7 +26,7 @@ A single [`openapi.yaml`](./openapi.yaml) describing two API namespaces:
 - 64 component schemas
 - 14 tags
 
-All requests use bearer tokens of the form `tw_live_xxxxxxxxxxxxxxxx`, issued at <https://www.ticketwavehq.com/dashboard/settings/api-keys>. Tenant scoping is enforced server-side on every row — cross-tenant probes resolve to `404`, never `403`, so the surface cannot be used to enumerate other tenants.
+All requests use bearer tokens of the form `tw_live_xxxxxxxxxxxxxxxx`, issued at <https://ticketwavehq.com/dashboard/settings/api-keys>. Tenant scoping is enforced server-side on every row — cross-tenant probes resolve to `404`, never `403`, so the surface cannot be used to enumerate other tenants.
 
 ---
 
@@ -96,4 +96,37 @@ Found a discrepancy between the spec and the live API? Open an issue here, or em
 
 Apache License 2.0 — see [`LICENSE`](./LICENSE).
 
-The TicketWave API itself is offered under the proprietary [TicketWave Public API Terms](https://www.ticketwavehq.com/terms); this OpenAPI document describing the API is Apache-2.0 so you can vendor, fork, generate clients from, and redistribute it freely.
+The TicketWave API itself is offered under the proprietary [TicketWave Public API Terms](https://ticketwavehq.com/terms); this OpenAPI document describing the API is Apache-2.0 so you can vendor, fork, generate clients from, and redistribute it freely.
+
+---
+
+## Organization metadata
+
+```json
+{
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  "name": "TicketWave",
+  "legalName": "TicketWave HQ Ltd",
+  "url": "https://ticketwavehq.com",
+  "logo": "https://ticketwavehq.com/logo.png",
+  "description": "TicketWave is an events-and-access platform providing a public REST API for events, orders, and the access-decision engine.",
+  "sameAs": [
+    "https://github.com/TicketWaveHQ"
+  ],
+  "contactPoint": [
+    {
+      "@type": "ContactPoint",
+      "contactType": "developer support",
+      "email": "developers@ticketwavehq.com",
+      "url": "https://ticketwavehq.com/developers"
+    },
+    {
+      "@type": "ContactPoint",
+      "contactType": "security",
+      "email": "security@ticketwavehq.com"
+    }
+  ]
+}
+```
+
